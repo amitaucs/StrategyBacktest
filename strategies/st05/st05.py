@@ -90,6 +90,33 @@ MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))
 ENABLE_BREAKEVEN = os.getenv("ENABLE_BREAKEVEN", "True").lower() in ("true", "1", "yes")
 BREAKEVEN_R_MULTIPLE = float(os.getenv("BREAKEVEN_R_MULTIPLE", "1.5"))
 
+# Quant Fix 1: Enforce Fresh Crossover / First Pullback Only (Cuts churn and fee drag)
+ENFORCE_FRESH_CROSSOVER_ONLY = os.getenv("ENFORCE_FRESH_CROSSOVER_ONLY", "True").lower() in ("true", "1", "yes")
+
+# Quant Fix 2: ATR Setup Candle Filter & Volatility-Buffered SL
+ENABLE_ATR_SETUP_FILTER = os.getenv("ENABLE_ATR_SETUP_FILTER", "True").lower() in ("true", "1", "yes")
+ATR_SETUP_MIN_MULT = float(os.getenv("ATR_SETUP_MIN_MULT", "0.5"))
+ATR_SETUP_MAX_MULT = float(os.getenv("ATR_SETUP_MAX_MULT", "1.3"))
+ENTRY_TRIGGER_BUFFER_PTS = float(os.getenv("ENTRY_TRIGGER_BUFFER_PTS", "2.0"))
+SL_ATR_BUFFER_MULT = float(os.getenv("SL_ATR_BUFFER_MULT", "0.25"))
+
+# Quant Fix 3: Hard Time-of-Day Window (09:30 AM to 13:15 PM IST)
+ENABLE_TIME_WINDOW_FILTER = os.getenv("ENABLE_TIME_WINDOW_FILTER", "True").lower() in ("true", "1", "yes")
+ENTRY_WINDOW_START_TIME = dt.time(9, 30)
+ENTRY_WINDOW_END_TIME = dt.time(13, 15)
+
+# Quant Fix 4: ADX / EMA-Spread Choppiness Filter
+ENABLE_CHOPPINESS_FILTER = os.getenv("ENABLE_CHOPPINESS_FILTER", "True").lower() in ("true", "1", "yes")
+ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
+ADX_MIN_THRESHOLD = float(os.getenv("ADX_MIN_THRESHOLD", "20.0"))
+EMA_SPREAD_MIN_PCT = float(os.getenv("EMA_SPREAD_MIN_PCT", "0.08"))  # 0.08% of close
+
+# Quant Fix 5: Dynamic Trailing Stop (1.5R Breakeven + 4 pts, 2.0R Trail EMA 20)
+ENABLE_DYNAMIC_TRAILING_STOP = os.getenv("ENABLE_DYNAMIC_TRAILING_STOP", "True").lower() in ("true", "1", "yes")
+TRAILING_R1_MULT = float(os.getenv("TRAILING_R1_MULT", "1.5"))
+TRAILING_R1_OFFSET_PTS = float(os.getenv("TRAILING_R1_OFFSET_PTS", "4.0"))
+TRAILING_R2_MULT = float(os.getenv("TRAILING_R2_MULT", "2.0"))
+
 # CAGR Performance Rating Thresholds (in %) from env
 CAGR_BAD_BELOW = float(os.getenv("CAGR_BAD_BELOW", "12.0"))
 CAGR_ACCEPTABLE_MAX = float(os.getenv("CAGR_ACCEPTABLE_MAX", "16.0"))
@@ -307,7 +334,7 @@ EMA_FAST = 10
 EMA_SLOW = 20
 ST_PERIOD = 10               # Standard SuperTrend ATR Period
 ST_MULTIPLIER = 3.0          # Standard SuperTrend Multiplier
-RISK_REWARD_RATIO = 3.0      # 1:3 Target (can change to 4.0 for 1:4)
+RISK_REWARD_RATIO = float(os.getenv("RISK_REWARD_RATIO", "3.0"))      # 1:3.0 Target calibrated for intraday execution
 
 # ==============================================================================
 # 2. FETCH HISTORICAL INTRADAY NIFTY DATA VIA DHANHQ API (CHUNKED)
@@ -464,6 +491,24 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
             st_dir[i] = st_dir[i-1]
 
     df["st_dir"] = st_dir
+
+    # Quant Fix 2: 14-period ATR for Setup Candle Size Filtering & SL Volatility Buffering
+    df["atr14"] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    # Quant Fix 4: 14-period ADX & EMA Spread % Choppiness Filter
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+    pos_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    neg_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    pos_dm_s = pd.Series(pos_dm, index=df.index).ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+    neg_dm_s = pd.Series(neg_dm, index=df.index).ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+    pos_di = 100.0 * (pos_dm_s / (df["atr14"] + 1e-9))
+    neg_di = 100.0 * (neg_dm_s / (df["atr14"] + 1e-9))
+    dx = 100.0 * (pos_di - neg_di).abs() / (pos_di + neg_di + 1e-9)
+    df["adx14"] = dx.ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+    df["adx14_rising"] = df["adx14"] > df["adx14"].shift(1)
+    df["ema_spread_pct"] = (df["ema10"] - df["ema20"]).abs() / df["close"] * 100.0
+
     df["date"] = df["timestamp"].dt.date
     df["time"] = df["timestamp"].dt.time
     return df
@@ -498,12 +543,36 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
         day_losses_count = 0
         lot_size = get_nifty_lot_size(trade_date)
         
+        # Quant Fix 1: State tracking for First Pullback / Fresh Crossover Only
+        long_wave_active = False
+        short_wave_active = False
+        prev_ema_cross = day_df.iloc[0]["ema10"] > day_df.iloc[0]["ema20"]
+        prev_st_dir = day_df.iloc[0]["st_dir"]
+        
         for i in range(1, len(day_df)):
             row = day_df.iloc[i]
             
             # Review 4: Skip warm-up candles to avoid initialization-dependent signals
             if row.get("is_warmup", False):
                 continue
+            
+            # Quant Fix 1: Detect Crossover & Pullback Resets
+            curr_ema_cross = row["ema10"] > row["ema20"]
+            if curr_ema_cross != prev_ema_cross:
+                long_wave_active = False
+                short_wave_active = False
+                prev_ema_cross = curr_ema_cross
+                
+            if row["st_dir"] != prev_st_dir:
+                long_wave_active = False
+                short_wave_active = False
+                prev_st_dir = row["st_dir"]
+                
+            # If price pulls back to touch 20 EMA, a fresh pullback entry is armed
+            if curr_ema_cross and row["low"] <= row["ema20"]:
+                long_wave_active = False
+            if not curr_ema_cross and row["high"] >= row["ema20"]:
+                short_wave_active = False
             
             # ==================================================================
             # 1. MANAGE EXISTING OPEN POSITION (From prior candles)
@@ -546,7 +615,9 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                         pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
                         pnl_pts_net = pnl_inr_net / position["qty"]
                         current_capital += pnl_inr_net
-                        exit_reason = "BREAKEVEN" if position["be_triggered"] and sl_fill >= position["entry"] else "SL_AMBIGUOUS"
+                        exit_reason = "TRAIL_EMA20" if position.get("trail_ema_active", False) else (
+                            "BREAKEVEN_PLUS" if position.get("be_triggered", False) and sl_fill >= position["entry"] else "SL_AMBIGUOUS"
+                        )
                         trades.append({**position, "exit_time": row["timestamp"], "exit": sl_fill,
                                        "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": exit_reason,
                                        "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
@@ -561,7 +632,9 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                         pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
                         pnl_pts_net = pnl_inr_net / position["qty"]
                         current_capital += pnl_inr_net
-                        exit_reason = "BREAKEVEN" if position["be_triggered"] and sl_fill >= position["entry"] else "SL"
+                        exit_reason = "TRAIL_EMA20" if position.get("trail_ema_active", False) else (
+                            "BREAKEVEN_PLUS" if position.get("be_triggered", False) and sl_fill >= position["entry"] else "SL"
+                        )
                         trades.append({**position, "exit_time": row["timestamp"], "exit": sl_fill,
                                        "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": exit_reason,
                                        "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
@@ -581,7 +654,15 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                         day_trades_count += 1
                         position = None
                     else:
-                        if ENABLE_BREAKEVEN and not position["be_triggered"]:
+                        if ENABLE_DYNAMIC_TRAILING_STOP:
+                            if row["high"] >= position["entry"] + (TRAILING_R2_MULT * position["risk_pts"]):
+                                position["trail_ema_active"] = True
+                            if row["high"] >= position["entry"] + (TRAILING_R1_MULT * position["risk_pts"]):
+                                position["be_triggered"] = True
+                                position["sl"] = max(position["sl"], position["entry"] + TRAILING_R1_OFFSET_PTS)
+                            if position.get("trail_ema_active", False):
+                                position["sl"] = max(position["sl"], row["ema20"])
+                        elif ENABLE_BREAKEVEN and not position["be_triggered"]:
                             if row["high"] >= position["entry"] + (BREAKEVEN_R_MULTIPLE * position["risk_pts"]):
                                 position["sl"] = max(position["sl"], position["entry"])
                                 position["be_triggered"] = True
@@ -597,7 +678,9 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                         pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
                         pnl_pts_net = pnl_inr_net / position["qty"]
                         current_capital += pnl_inr_net
-                        exit_reason = "BREAKEVEN" if position["be_triggered"] and sl_fill <= position["entry"] else "SL_AMBIGUOUS"
+                        exit_reason = "TRAIL_EMA20" if position.get("trail_ema_active", False) else (
+                            "BREAKEVEN_PLUS" if position.get("be_triggered", False) and sl_fill <= position["entry"] else "SL_AMBIGUOUS"
+                        )
                         trades.append({**position, "exit_time": row["timestamp"], "exit": sl_fill,
                                        "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": exit_reason,
                                        "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
@@ -612,7 +695,9 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                         pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
                         pnl_pts_net = pnl_inr_net / position["qty"]
                         current_capital += pnl_inr_net
-                        exit_reason = "BREAKEVEN" if position["be_triggered"] and sl_fill <= position["entry"] else "SL"
+                        exit_reason = "TRAIL_EMA20" if position.get("trail_ema_active", False) else (
+                            "BREAKEVEN_PLUS" if position.get("be_triggered", False) and sl_fill <= position["entry"] else "SL"
+                        )
                         trades.append({**position, "exit_time": row["timestamp"], "exit": sl_fill,
                                        "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": exit_reason,
                                        "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
@@ -632,7 +717,15 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                         day_trades_count += 1
                         position = None
                     else:
-                        if ENABLE_BREAKEVEN and not position["be_triggered"]:
+                        if ENABLE_DYNAMIC_TRAILING_STOP:
+                            if row["low"] <= position["entry"] - (TRAILING_R2_MULT * position["risk_pts"]):
+                                position["trail_ema_active"] = True
+                            if row["low"] <= position["entry"] - (TRAILING_R1_MULT * position["risk_pts"]):
+                                position["be_triggered"] = True
+                                position["sl"] = min(position["sl"], position["entry"] - TRAILING_R1_OFFSET_PTS)
+                            if position.get("trail_ema_active", False):
+                                position["sl"] = min(position["sl"], row["ema20"])
+                        elif ENABLE_BREAKEVEN and not position["be_triggered"]:
                             if row["low"] <= position["entry"] - (BREAKEVEN_R_MULTIPLE * position["risk_pts"]):
                                 position["sl"] = min(position["sl"], position["entry"])
                                 position["be_triggered"] = True
@@ -643,7 +736,18 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
             # ==================================================================
             # 2. TRIGGER PENDING SETUP ON CURRENT BAR (Friction-Inclusive 1% Sizing & Sequencing Fix)
             # ==================================================================
-            if position is None and pending_setup is not None and row["time"] <= dt.time(14, 30) and can_trade_today:
+            # Quant Fix 3: Hard Time-of-Day Window (09:30 AM to 13:15 PM IST)
+            within_entry_window = (
+                (row["time"] >= ENTRY_WINDOW_START_TIME and row["time"] <= ENTRY_WINDOW_END_TIME)
+                if ENABLE_TIME_WINDOW_FILTER else (row["time"] <= dt.time(14, 30))
+            )
+
+            # Expire pending setup if past allowable entry window
+            cutoff_entry_time = ENTRY_WINDOW_END_TIME if ENABLE_TIME_WINDOW_FILTER else dt.time(14, 30)
+            if pending_setup is not None and row["time"] > cutoff_entry_time:
+                pending_setup = None
+
+            if position is None and pending_setup is not None and within_entry_window and can_trade_today:
                 if pending_setup["side"] == "LONG" and row["high"] > pending_setup["trigger"]:
                     entry_px = max(row["open"], pending_setup["trigger"])
                     risk = entry_px - pending_setup["sl"]
@@ -666,7 +770,7 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                             "date": trade_date, "side": "LONG", "entry_time": row["timestamp"],
                             "entry": entry_px, "sl": pending_setup["sl"], "risk_pts": risk,
                             "target": entry_px + (RISK_REWARD_RATIO * risk),
-                            "lots": lots, "qty": qty, "be_triggered": False,
+                            "lots": lots, "qty": qty, "be_triggered": False, "trail_ema_active": False,
                             "mae_pts": max(0.0, entry_px - row["low"])
                         }
                         
@@ -703,11 +807,20 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                             day_trades_count += 1
                             position = None
                         else:
-                            if ENABLE_BREAKEVEN and row["high"] >= pos["entry"] + (BREAKEVEN_R_MULTIPLE * pos["risk_pts"]):
+                            if ENABLE_DYNAMIC_TRAILING_STOP:
+                                if row["high"] >= pos["entry"] + (TRAILING_R2_MULT * pos["risk_pts"]):
+                                    pos["trail_ema_active"] = True
+                                if row["high"] >= pos["entry"] + (TRAILING_R1_MULT * pos["risk_pts"]):
+                                    pos["be_triggered"] = True
+                                    pos["sl"] = max(pos["sl"], pos["entry"] + TRAILING_R1_OFFSET_PTS)
+                                if pos.get("trail_ema_active", False):
+                                    pos["sl"] = max(pos["sl"], row["ema20"])
+                            elif ENABLE_BREAKEVEN and row["high"] >= pos["entry"] + (BREAKEVEN_R_MULTIPLE * pos["risk_pts"]):
                                 pos["sl"] = max(pos["sl"], pos["entry"])
                                 pos["be_triggered"] = True
                             position = pos
                             
+                    long_wave_active = True
                     pending_setup = None
 
                 elif pending_setup["side"] == "SHORT" and row["low"] < pending_setup["trigger"]:
@@ -731,7 +844,7 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                             "date": trade_date, "side": "SHORT", "entry_time": row["timestamp"],
                             "entry": entry_px, "sl": pending_setup["sl"], "risk_pts": risk,
                             "target": entry_px - (RISK_REWARD_RATIO * risk),
-                            "lots": lots, "qty": qty, "be_triggered": False,
+                            "lots": lots, "qty": qty, "be_triggered": False, "trail_ema_active": False,
                             "mae_pts": max(0.0, row["high"] - entry_px)
                         }
                         
@@ -765,19 +878,34 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                             day_trades_count += 1
                             position = None
                         else:
-                            if ENABLE_BREAKEVEN and row["low"] <= pos["entry"] - (BREAKEVEN_R_MULTIPLE * pos["risk_pts"]):
+                            if ENABLE_DYNAMIC_TRAILING_STOP:
+                                if row["low"] <= pos["entry"] - (TRAILING_R2_MULT * pos["risk_pts"]):
+                                    pos["trail_ema_active"] = True
+                                if row["low"] <= pos["entry"] - (TRAILING_R1_MULT * pos["risk_pts"]):
+                                    pos["be_triggered"] = True
+                                    pos["sl"] = min(pos["sl"], pos["entry"] - TRAILING_R1_OFFSET_PTS)
+                                if pos.get("trail_ema_active", False):
+                                    pos["sl"] = min(pos["sl"], row["ema20"])
+                            elif ENABLE_BREAKEVEN and row["low"] <= pos["entry"] - (BREAKEVEN_R_MULTIPLE * pos["risk_pts"]):
                                 pos["sl"] = min(pos["sl"], pos["entry"])
                                 pos["be_triggered"] = True
                             position = pos
                             
+                    short_wave_active = True
                     pending_setup = None
             elif not can_trade_today:
                 pending_setup = None
 
             # ==================================================================
-            # 3. IDENTIFY NEW SETUP CANDLE (ST05 Alignment)
+            # 3. IDENTIFY NEW SETUP CANDLE (ST05 Alignment + Quant Filters)
             # ==================================================================
-            if position is None and row["time"] < dt.time(14, 15) and can_trade_today:
+            # Quant Fix 3: Skip 09:15-09:30 morning opening bar; cutoff setup formation at 13:00 (so trigger is <= 13:15)
+            within_setup_window = (
+                (row["time"] >= ENTRY_WINDOW_START_TIME and row["time"] < ENTRY_WINDOW_END_TIME)
+                if ENABLE_TIME_WINDOW_FILTER else (row["time"] < dt.time(14, 15))
+            )
+
+            if position is None and within_setup_window and can_trade_today:
                 is_green = row["close"] > row["open"]
                 is_red = row["close"] < row["open"]
                 
@@ -797,10 +925,45 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                     row["st_dir"] == -1 and is_red
                 )
                 
-                if long_aligned:
-                    pending_setup = {"side": "LONG", "trigger": row["high"], "sl": row["low"]}
-                elif short_aligned:
-                    pending_setup = {"side": "SHORT", "trigger": row["low"], "sl": row["high"]}
+                # Quant Fix 4: ADX / EMA-Spread Choppiness Filter (Must not be pinched flat or non-trending)
+                if ENABLE_CHOPPINESS_FILTER:
+                    adx_rising = row.get("adx14_rising", False)
+                    adx_trending = (row["adx14"] > ADX_MIN_THRESHOLD) and adx_rising
+                    ema_spread_trending = row["ema_spread_pct"] > EMA_SPREAD_MIN_PCT
+                    regime_trending = adx_trending or ema_spread_trending
+                else:
+                    regime_trending = True
+
+                # Quant Fix 2: Setup Candle Size Filter (0.5 * ATR14 <= range <= 1.3 * ATR14)
+                candle_range = row["high"] - row["low"]
+                if ENABLE_ATR_SETUP_FILTER:
+                    valid_candle_size = (ATR_SETUP_MIN_MULT * row["atr14"] <= candle_range <= ATR_SETUP_MAX_MULT * row["atr14"])
+                else:
+                    valid_candle_size = True
+
+                # Quant Fix 1: Filter out repetitive entries in the same ongoing wave without a pullback
+                can_take_long = (not long_wave_active) if ENFORCE_FRESH_CROSSOVER_ONLY else True
+                can_take_short = (not short_wave_active) if ENFORCE_FRESH_CROSSOVER_ONLY else True
+
+                if long_aligned and regime_trending and valid_candle_size and can_take_long:
+                    # Quant Fix 2: Buffer Trigger (+2 pts) and Stop-Loss (-0.25*ATR14 or EMA20)
+                    if ENABLE_ATR_SETUP_FILTER:
+                        trigger_px = row["high"] + ENTRY_TRIGGER_BUFFER_PTS
+                        sl_px = min(row["low"] - (SL_ATR_BUFFER_MULT * row["atr14"]), row["ema20"])
+                    else:
+                        trigger_px = row["high"]
+                        sl_px = row["low"]
+                    pending_setup = {"side": "LONG", "trigger": trigger_px, "sl": sl_px}
+                    
+                elif short_aligned and regime_trending and valid_candle_size and can_take_short:
+                    # Quant Fix 2: Buffer Trigger (-2 pts) and Stop-Loss (+0.25*ATR14 or EMA20)
+                    if ENABLE_ATR_SETUP_FILTER:
+                        trigger_px = row["low"] - ENTRY_TRIGGER_BUFFER_PTS
+                        sl_px = max(row["high"] + (SL_ATR_BUFFER_MULT * row["atr14"]), row["ema20"])
+                    else:
+                        trigger_px = row["low"]
+                        sl_px = row["high"]
+                    pending_setup = {"side": "SHORT", "trigger": trigger_px, "sl": sl_px}
 
         # End of Day Fail-Safe (Ensures positions NEVER silently disappear & flags truncated days)
         if position is not None:

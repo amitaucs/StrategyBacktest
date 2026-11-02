@@ -24,19 +24,44 @@ INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "1000000.0"))
 NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 NUM_LOTS = int(os.getenv("NUM_LOTS", "2"))
 QUANTITY = NIFTY_LOT_SIZE * NUM_LOTS
-# Point 12: Realistic Derivative Friction (STT 5.0 pts + Exchange/GST 1.0 pt + Brokerage 0.6 pt + Stamp 0.4 pt + Slippage 1.5 pts = ~8.5 pts)
-SLIPPAGE_AND_COSTS_PTS = float(os.getenv("SLIPPAGE_AND_COSTS_PTS", "8.0"))
+EXECUTION_SLIPPAGE_PTS = float(os.getenv("EXECUTION_SLIPPAGE_PTS", "2.0"))
 
-# Enhancement 4: Historical Lot Size & Derivative Friction
+# Exact Statutory Cost Calculator for NSE Nifty Futures Turnover
+def calculate_statutory_costs(entry_px: float, exit_px: float, qty: int, side: str = "LONG") -> float:
+    """
+    Calculates exact statutory taxes & regulatory fees for Nifty Futures turnover:
+    - STT: 0.02% on Sell turnover leg (SEBI revised Oct 1, 2024)
+    - Exchange Turnover Charge: 0.00173% on both legs + 18% GST (0.0020414% total)
+    - Brokerage: ₹20 / executed order flat (₹40 roundtrip) + 18% GST (₹47.20)
+    - Stamp Duty: 0.002% on Buy turnover leg
+    - SEBI Turnover Charges: ₹10 / crore + 18% GST on both legs
+    """
+    buy_px = entry_px if side == "LONG" else exit_px
+    sell_px = exit_px if side == "LONG" else entry_px
+    
+    buy_turnover = buy_px * qty
+    sell_turnover = sell_px * qty
+    total_turnover = buy_turnover + sell_turnover
+    
+    stt = 0.0002 * sell_turnover
+    brokerage = 47.20
+    exchange_charges = 0.000020414 * total_turnover
+    stamp_duty = 0.00002 * buy_turnover
+    sebi_charges = (10.0 / 10000000.0) * total_turnover * 1.18
+    
+    return stt + brokerage + exchange_charges + stamp_duty + sebi_charges
+
+# Enhancement 4: Exact Regulatory 5-Tier Historical Lot Size Calendar
 USE_HISTORICAL_LOT_SIZES = os.getenv("USE_HISTORICAL_LOT_SIZES", "True").lower() in ("true", "1", "yes")
 
 def get_nifty_lot_size(trade_date: dt.date) -> int:
     """
     Returns exact NSE regulatory lot size for Nifty derivatives by time period:
-    - Prior to July 2021: 75
-    - July 2021 to April 2024: 50
-    - April 2024 to Nov 19, 2024: 25
-    - Nov 20, 2024 onwards: 75 (or NIFTY_LOT_SIZE from .env)
+    - Up to 30-Jun-2021: 75
+    - 01-Jul-2021 to 25-Apr-2024: 50
+    - 26-Apr-2024 to 19-Nov-2024: 25
+    - 20-Nov-2024 to 05-Jan-2026: 75 (NSE Circular FAOP64625)
+    - 06-Jan-2026 onwards: 65 (NSE Circular FAOP70616)
     """
     if not USE_HISTORICAL_LOT_SIZES:
         return NIFTY_LOT_SIZE
@@ -46,8 +71,10 @@ def get_nifty_lot_size(trade_date: dt.date) -> int:
         return 50
     elif trade_date < dt.date(2024, 11, 20):
         return 25
+    elif trade_date < dt.date(2026, 1, 6):
+        return 75
     else:
-        return NIFTY_LOT_SIZE
+        return 65
 
 # Enhancement 1: Dynamic Position Sizing (Fixed Fractional Risk)
 ENABLE_DYNAMIC_SIZING = os.getenv("ENABLE_DYNAMIC_SIZING", "True").lower() in ("true", "1", "yes")
@@ -351,7 +378,10 @@ def fetch_dhan_intraday(dhan: dhanhq, months: int = BACKTEST_MONTHS) -> pd.DataF
                     time.sleep(1.5)
 
         if not chunk_success:
-            print(f"  ✗ Warning: Could not fetch chunk {curr_start} -> {curr_end} after {max_retries} retries.")
+            raise RuntimeError(
+                f"Data Completeness Error: Failed to fetch chunk {curr_start} to {curr_end} after {max_retries} retries. "
+                f"Aborting backtest to ensure metrics are not corrupted by missing periods."
+            )
 
         curr_start = curr_end + dt.timedelta(days=1)
 
@@ -479,63 +509,78 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
             # 1. MANAGE EXISTING OPEN POSITION (From prior candles)
             # ==================================================================
             if position is not None:
+                # Update intratrade Maximum Adverse Excursion (MAE)
+                if position["side"] == "LONG":
+                    adverse = max(0.0, position["entry"] - row["low"])
+                else:
+                    adverse = max(0.0, row["high"] - position["entry"])
+                position["mae_pts"] = max(position.get("mae_pts", 0.0), adverse)
+
                 # Point 6: End of Day Intraday Square-off at 15:15 IST sharp (Fill at open of 15:15 bar)
                 if row["time"] >= dt.time(15, 15):
                     exit_price = row["open"]
-                    pnl_pts = (exit_price - position["entry"]) if position["side"] == "LONG" else (position["entry"] - exit_price)
-                    pnl_pts -= SLIPPAGE_AND_COSTS_PTS
-                    pnl_inr = pnl_pts * position["qty"]
-                    current_capital += pnl_inr
+                    stat_cost = calculate_statutory_costs(position["entry"], exit_price, position["qty"], position["side"])
+                    pnl_pts_gross = (exit_price - position["entry"]) if position["side"] == "LONG" else (position["entry"] - exit_price)
+                    pnl_pts_gross -= EXECUTION_SLIPPAGE_PTS
+                    pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
+                    pnl_pts_net = pnl_inr_net / position["qty"]
+                    current_capital += pnl_inr_net
                     trades.append({**position, "exit_time": row["timestamp"], "exit": exit_price,
-                                   "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "EOD_1515"})
+                                   "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": "EOD_1515",
+                                   "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
                     day_trades_count += 1
-                    if pnl_pts <= 0:
+                    if pnl_inr_net <= 0:
                         day_losses_count += 1
                     position = None
                     break
                 
-                # B. Check SL and Target with Conservative Ambiguity Resolution (Fix 2) & Gap Fills (Fix 5)
+                # B. Check SL and Target with Conservative Ambiguity Resolution & Gap Fills
                 if position["side"] == "LONG":
                     hit_sl = row["low"] <= position["sl"]
                     hit_target = row["high"] >= position["target"]
                     
                     if hit_sl and hit_target:
-                        # Ambiguous bar: Conservative assumption - Stop Loss was hit first!
-                        # Point 5: Gap-through-stop fill at adverse open price if opened gap down
                         sl_fill = min(row["open"], position["sl"])
-                        pnl_pts = (sl_fill - position["entry"]) - SLIPPAGE_AND_COSTS_PTS
-                        pnl_inr = pnl_pts * position["qty"]
-                        current_capital += pnl_inr
+                        stat_cost = calculate_statutory_costs(position["entry"], sl_fill, position["qty"], "LONG")
+                        pnl_pts_gross = (sl_fill - position["entry"]) - EXECUTION_SLIPPAGE_PTS
+                        pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
+                        pnl_pts_net = pnl_inr_net / position["qty"]
+                        current_capital += pnl_inr_net
                         exit_reason = "BREAKEVEN" if position["be_triggered"] and sl_fill >= position["entry"] else "SL_AMBIGUOUS"
                         trades.append({**position, "exit_time": row["timestamp"], "exit": sl_fill,
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": exit_reason})
+                                       "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": exit_reason,
+                                       "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
                         day_trades_count += 1
-                        if pnl_pts <= 0:
+                        if pnl_inr_net <= 0:
                             day_losses_count += 1
                         position = None
                     elif hit_sl:
-                        # Point 5: Gap fill
                         sl_fill = min(row["open"], position["sl"])
-                        pnl_pts = (sl_fill - position["entry"]) - SLIPPAGE_AND_COSTS_PTS
-                        pnl_inr = pnl_pts * position["qty"]
-                        current_capital += pnl_inr
+                        stat_cost = calculate_statutory_costs(position["entry"], sl_fill, position["qty"], "LONG")
+                        pnl_pts_gross = (sl_fill - position["entry"]) - EXECUTION_SLIPPAGE_PTS
+                        pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
+                        pnl_pts_net = pnl_inr_net / position["qty"]
+                        current_capital += pnl_inr_net
                         exit_reason = "BREAKEVEN" if position["be_triggered"] and sl_fill >= position["entry"] else "SL"
                         trades.append({**position, "exit_time": row["timestamp"], "exit": sl_fill,
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": exit_reason})
+                                       "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": exit_reason,
+                                       "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
                         day_trades_count += 1
-                        if pnl_pts <= 0:
+                        if pnl_inr_net <= 0:
                             day_losses_count += 1
                         position = None
                     elif hit_target:
-                        pnl_pts = (position["target"] - position["entry"]) - SLIPPAGE_AND_COSTS_PTS
-                        pnl_inr = pnl_pts * position["qty"]
-                        current_capital += pnl_inr
+                        stat_cost = calculate_statutory_costs(position["entry"], position["target"], position["qty"], "LONG")
+                        pnl_pts_gross = (position["target"] - position["entry"]) - EXECUTION_SLIPPAGE_PTS
+                        pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
+                        pnl_pts_net = pnl_inr_net / position["qty"]
+                        current_capital += pnl_inr_net
                         trades.append({**position, "exit_time": row["timestamp"], "exit": position["target"],
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "TARGET"})
+                                       "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": "TARGET",
+                                       "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
                         day_trades_count += 1
                         position = None
                     else:
-                        # Fix 3: Zero-Lookahead Breakeven (Armed strictly for future bars)
                         if ENABLE_BREAKEVEN and not position["be_triggered"]:
                             if row["high"] >= position["entry"] + (BREAKEVEN_R_MULTIPLE * position["risk_pts"]):
                                 position["sl"] = max(position["sl"], position["entry"])
@@ -546,37 +591,44 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                     hit_target = row["low"] <= position["target"]
                     
                     if hit_sl and hit_target:
-                        # Point 5: Gap-through-stop fill at adverse open price if opened gap up
                         sl_fill = max(row["open"], position["sl"])
-                        pnl_pts = (position["entry"] - sl_fill) - SLIPPAGE_AND_COSTS_PTS
-                        pnl_inr = pnl_pts * position["qty"]
-                        current_capital += pnl_inr
+                        stat_cost = calculate_statutory_costs(position["entry"], sl_fill, position["qty"], "SHORT")
+                        pnl_pts_gross = (position["entry"] - sl_fill) - EXECUTION_SLIPPAGE_PTS
+                        pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
+                        pnl_pts_net = pnl_inr_net / position["qty"]
+                        current_capital += pnl_inr_net
                         exit_reason = "BREAKEVEN" if position["be_triggered"] and sl_fill <= position["entry"] else "SL_AMBIGUOUS"
                         trades.append({**position, "exit_time": row["timestamp"], "exit": sl_fill,
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": exit_reason})
+                                       "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": exit_reason,
+                                       "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
                         day_trades_count += 1
-                        if pnl_pts <= 0:
+                        if pnl_inr_net <= 0:
                             day_losses_count += 1
                         position = None
                     elif hit_sl:
-                        # Point 5: Gap fill
                         sl_fill = max(row["open"], position["sl"])
-                        pnl_pts = (position["entry"] - sl_fill) - SLIPPAGE_AND_COSTS_PTS
-                        pnl_inr = pnl_pts * position["qty"]
-                        current_capital += pnl_inr
+                        stat_cost = calculate_statutory_costs(position["entry"], sl_fill, position["qty"], "SHORT")
+                        pnl_pts_gross = (position["entry"] - sl_fill) - EXECUTION_SLIPPAGE_PTS
+                        pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
+                        pnl_pts_net = pnl_inr_net / position["qty"]
+                        current_capital += pnl_inr_net
                         exit_reason = "BREAKEVEN" if position["be_triggered"] and sl_fill <= position["entry"] else "SL"
                         trades.append({**position, "exit_time": row["timestamp"], "exit": sl_fill,
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": exit_reason})
+                                       "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": exit_reason,
+                                       "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
                         day_trades_count += 1
-                        if pnl_pts <= 0:
+                        if pnl_inr_net <= 0:
                             day_losses_count += 1
                         position = None
                     elif hit_target:
-                        pnl_pts = (position["entry"] - position["target"]) - SLIPPAGE_AND_COSTS_PTS
-                        pnl_inr = pnl_pts * position["qty"]
-                        current_capital += pnl_inr
+                        stat_cost = calculate_statutory_costs(position["entry"], position["target"], position["qty"], "SHORT")
+                        pnl_pts_gross = (position["entry"] - position["target"]) - EXECUTION_SLIPPAGE_PTS
+                        pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
+                        pnl_pts_net = pnl_inr_net / position["qty"]
+                        current_capital += pnl_inr_net
                         trades.append({**position, "exit_time": row["timestamp"], "exit": position["target"],
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "TARGET"})
+                                       "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": "TARGET",
+                                       "stat_cost": stat_cost, "mae_inr": position["mae_pts"] * position["qty"]})
                         day_trades_count += 1
                         position = None
                     else:
@@ -589,7 +641,7 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
             can_trade_today = (day_trades_count < MAX_TRADES_PER_DAY) and (day_losses_count < MAX_LOSSES_PER_DAY)
 
             # ==================================================================
-            # 2. TRIGGER PENDING SETUP ON CURRENT BAR (Fix 1: Immediate Bar Testing & Fix 8: True 1% Sizing)
+            # 2. TRIGGER PENDING SETUP ON CURRENT BAR (Friction-Inclusive 1% Sizing & Sequencing Fix)
             # ==================================================================
             if position is None and pending_setup is not None and row["time"] <= dt.time(14, 30) and can_trade_today:
                 if pending_setup["side"] == "LONG" and row["high"] > pending_setup["trigger"]:
@@ -598,9 +650,10 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                     if risk > 5:
                         if ENABLE_DYNAMIC_SIZING:
                             risk_budget = current_capital * (RISK_PER_TRADE_PCT / 100.0)
-                            risk_per_lot = risk * lot_size
+                            # Include execution slippage and estimated roundtrip statutory friction (~7 pts) in risk denominator
+                            total_risk_per_share = risk + EXECUTION_SLIPPAGE_PTS + 7.0
+                            risk_per_lot = total_risk_per_share * lot_size
                             affordable_lots = int(risk_budget / risk_per_lot) if risk_per_lot > 0 else 0
-                            # Point 8: Skip trade if account cannot afford 1 lot within 1% risk
                             if affordable_lots < 1:
                                 pending_setup = None
                                 continue
@@ -613,29 +666,40 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                             "date": trade_date, "side": "LONG", "entry_time": row["timestamp"],
                             "entry": entry_px, "sl": pending_setup["sl"], "risk_pts": risk,
                             "target": entry_px + (RISK_REWARD_RATIO * risk),
-                            "lots": lots, "qty": qty, "be_triggered": False
+                            "lots": lots, "qty": qty, "be_triggered": False,
+                            "mae_pts": max(0.0, entry_px - row["low"])
                         }
                         
-                        # Fix 1: Immediately evaluate the entry bar
-                        hit_sl_entry = row["low"] <= pos["sl"]
+                        # Entry Candle Sequencing:
+                        # If opened >= trigger (gap up): low occurred post-entry -> genuine stop.
+                        # If opened < trigger: candle rallied through trigger; only stop out if candle closed <= SL.
+                        is_gap_entry = row["open"] >= pending_setup["trigger"]
+                        closed_below_sl = row["close"] <= pos["sl"]
+                        hit_sl_entry = (is_gap_entry and row["low"] <= pos["sl"]) or closed_below_sl
                         hit_tgt_entry = row["high"] >= pos["target"]
                         
-                        if hit_sl_entry: # If both or SL hit, SL wins (Conservative)
-                            pnl_pts = (pos["sl"] - pos["entry"]) - SLIPPAGE_AND_COSTS_PTS
-                            pnl_inr = pnl_pts * pos["qty"]
-                            current_capital += pnl_inr
+                        if hit_sl_entry:
+                            stat_cost = calculate_statutory_costs(pos["entry"], pos["sl"], pos["qty"], "LONG")
+                            pnl_pts_gross = (pos["sl"] - pos["entry"]) - EXECUTION_SLIPPAGE_PTS
+                            pnl_inr_net = (pnl_pts_gross * pos["qty"]) - stat_cost
+                            pnl_pts_net = pnl_inr_net / pos["qty"]
+                            current_capital += pnl_inr_net
                             trades.append({**pos, "exit_time": row["timestamp"], "exit": pos["sl"],
-                                           "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "SL_ENTRY_BAR"})
+                                           "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": "SL_ENTRY_BAR",
+                                           "stat_cost": stat_cost, "mae_inr": pos["mae_pts"] * pos["qty"]})
                             day_trades_count += 1
-                            if pnl_pts <= 0:
+                            if pnl_inr_net <= 0:
                                 day_losses_count += 1
                             position = None
                         elif hit_tgt_entry:
-                            pnl_pts = (pos["target"] - pos["entry"]) - SLIPPAGE_AND_COSTS_PTS
-                            pnl_inr = pnl_pts * pos["qty"]
-                            current_capital += pnl_inr
+                            stat_cost = calculate_statutory_costs(pos["entry"], pos["target"], pos["qty"], "LONG")
+                            pnl_pts_gross = (pos["target"] - pos["entry"]) - EXECUTION_SLIPPAGE_PTS
+                            pnl_inr_net = (pnl_pts_gross * pos["qty"]) - stat_cost
+                            pnl_pts_net = pnl_inr_net / pos["qty"]
+                            current_capital += pnl_inr_net
                             trades.append({**pos, "exit_time": row["timestamp"], "exit": pos["target"],
-                                           "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "TARGET_ENTRY_BAR"})
+                                           "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": "TARGET_ENTRY_BAR",
+                                           "stat_cost": stat_cost, "mae_inr": pos["mae_pts"] * pos["qty"]})
                             day_trades_count += 1
                             position = None
                         else:
@@ -652,9 +716,9 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                     if risk > 5:
                         if ENABLE_DYNAMIC_SIZING:
                             risk_budget = current_capital * (RISK_PER_TRADE_PCT / 100.0)
-                            risk_per_lot = risk * lot_size
+                            total_risk_per_share = risk + EXECUTION_SLIPPAGE_PTS + 7.0
+                            risk_per_lot = total_risk_per_share * lot_size
                             affordable_lots = int(risk_budget / risk_per_lot) if risk_per_lot > 0 else 0
-                            # Point 8: Skip trade if account cannot afford 1 lot within 1% risk
                             if affordable_lots < 1:
                                 pending_setup = None
                                 continue
@@ -667,29 +731,37 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                             "date": trade_date, "side": "SHORT", "entry_time": row["timestamp"],
                             "entry": entry_px, "sl": pending_setup["sl"], "risk_pts": risk,
                             "target": entry_px - (RISK_REWARD_RATIO * risk),
-                            "lots": lots, "qty": qty, "be_triggered": False
+                            "lots": lots, "qty": qty, "be_triggered": False,
+                            "mae_pts": max(0.0, row["high"] - entry_px)
                         }
                         
-                        # Fix 1: Immediately evaluate the entry bar
-                        hit_sl_entry = row["high"] >= pos["sl"]
+                        is_gap_entry = row["open"] <= pending_setup["trigger"]
+                        closed_above_sl = row["close"] >= pos["sl"]
+                        hit_sl_entry = (is_gap_entry and row["high"] >= pos["sl"]) or closed_above_sl
                         hit_tgt_entry = row["low"] <= pos["target"]
                         
                         if hit_sl_entry:
-                            pnl_pts = (pos["entry"] - pos["sl"]) - SLIPPAGE_AND_COSTS_PTS
-                            pnl_inr = pnl_pts * pos["qty"]
-                            current_capital += pnl_inr
+                            stat_cost = calculate_statutory_costs(pos["entry"], pos["sl"], pos["qty"], "SHORT")
+                            pnl_pts_gross = (pos["entry"] - pos["sl"]) - EXECUTION_SLIPPAGE_PTS
+                            pnl_inr_net = (pnl_pts_gross * pos["qty"]) - stat_cost
+                            pnl_pts_net = pnl_inr_net / pos["qty"]
+                            current_capital += pnl_inr_net
                             trades.append({**pos, "exit_time": row["timestamp"], "exit": pos["sl"],
-                                           "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "SL_ENTRY_BAR"})
+                                           "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": "SL_ENTRY_BAR",
+                                           "stat_cost": stat_cost, "mae_inr": pos["mae_pts"] * pos["qty"]})
                             day_trades_count += 1
-                            if pnl_pts <= 0:
+                            if pnl_inr_net <= 0:
                                 day_losses_count += 1
                             position = None
                         elif hit_tgt_entry:
-                            pnl_pts = (pos["entry"] - pos["target"]) - SLIPPAGE_AND_COSTS_PTS
-                            pnl_inr = pnl_pts * pos["qty"]
-                            current_capital += pnl_inr
+                            stat_cost = calculate_statutory_costs(pos["entry"], pos["target"], pos["qty"], "SHORT")
+                            pnl_pts_gross = (pos["entry"] - pos["target"]) - EXECUTION_SLIPPAGE_PTS
+                            pnl_inr_net = (pnl_pts_gross * pos["qty"]) - stat_cost
+                            pnl_pts_net = pnl_inr_net / pos["qty"]
+                            current_capital += pnl_inr_net
                             trades.append({**pos, "exit_time": row["timestamp"], "exit": pos["target"],
-                                           "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "TARGET_ENTRY_BAR"})
+                                           "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": "TARGET_ENTRY_BAR",
+                                           "stat_cost": stat_cost, "mae_inr": pos["mae_pts"] * pos["qty"]})
                             day_trades_count += 1
                             position = None
                         else:
@@ -730,19 +802,28 @@ def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
                 elif short_aligned:
                     pending_setup = {"side": "SHORT", "trigger": row["low"], "sl": row["high"]}
 
-        # Point 7: End of Day Fail-Safe (Ensures positions NEVER silently disappear)
+        # End of Day Fail-Safe (Ensures positions NEVER silently disappear & flags truncated days)
         if position is not None:
             last_row = day_df.iloc[-1]
-            exit_price = last_row["close"]
-            pnl_pts = (exit_price - position["entry"]) if position["side"] == "LONG" else (position["entry"] - exit_price)
-            pnl_pts -= SLIPPAGE_AND_COSTS_PTS
-            pnl_inr = pnl_pts * position["qty"]
-            current_capital += pnl_inr
-            trades.append({**position, "exit_time": last_row["timestamp"], "exit": exit_price,
-                           "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "EOD_FORCED"})
-            day_trades_count += 1
-            if pnl_pts <= 0:
-                day_losses_count += 1
+            if last_row["time"] < dt.time(15, 0):
+                # Truncated session: mark unresolved rather than fabricating a fill
+                trades.append({**position, "exit_time": last_row["timestamp"], "exit": last_row["close"],
+                               "pnl_pts": 0.0, "pnl_inr": 0.0, "exit_reason": "UNRESOLVED_TRUNCATED_SESSION",
+                               "stat_cost": 0.0, "mae_inr": position.get("mae_pts", 0.0) * position["qty"]})
+            else:
+                exit_price = last_row["close"]
+                stat_cost = calculate_statutory_costs(position["entry"], exit_price, position["qty"], position["side"])
+                pnl_pts_gross = (exit_price - position["entry"]) if position["side"] == "LONG" else (position["entry"] - exit_price)
+                pnl_pts_gross -= EXECUTION_SLIPPAGE_PTS
+                pnl_inr_net = (pnl_pts_gross * position["qty"]) - stat_cost
+                pnl_pts_net = pnl_inr_net / position["qty"]
+                current_capital += pnl_inr_net
+                trades.append({**position, "exit_time": last_row["timestamp"], "exit": exit_price,
+                               "pnl_pts": pnl_pts_net, "pnl_inr": pnl_inr_net, "exit_reason": "EOD_FORCED",
+                               "stat_cost": stat_cost, "mae_inr": position.get("mae_pts", 0.0) * position["qty"]})
+                day_trades_count += 1
+                if pnl_inr_net <= 0:
+                    day_losses_count += 1
             position = None
 
     return pd.DataFrame(trades)
@@ -786,9 +867,15 @@ def generate_performance_summary(trades_df: pd.DataFrame, all_dates: pd.Series):
     trade_max_dd_pct = ((trade_peak - trade_equity) / trade_peak).max() * 100
     trade_max_dd_inr = (trade_peak - trade_equity).max()
 
-    # Take the conservative (maximum) of daily and trade-by-trade drawdown
-    max_dd_pct = max(daily_max_dd_pct, trade_max_dd_pct)
-    max_dd_inr = max(daily_max_dd_inr, trade_max_dd_inr)
+    # Review 7: Intratrade Maximum Adverse Excursion (MAE) drawdown
+    mae_series = trades_df["mae_inr"] if "mae_inr" in trades_df else pd.Series([0.0]*len(trades_df))
+    intratrade_troughs = (trade_peak.iloc[:-1].values - trade_equity.iloc[:-1].values) + mae_series.values
+    intratrade_max_dd_inr = float(intratrade_troughs.max()) if len(intratrade_troughs) > 0 else 0.0
+    intratrade_max_dd_pct = (intratrade_max_dd_inr / INITIAL_CAPITAL) * 100
+
+    # Take the conservative maximum of daily, trade-by-trade, and intratrade MAE drawdown
+    max_dd_pct = max(daily_max_dd_pct, trade_max_dd_pct, intratrade_max_dd_pct)
+    max_dd_inr = max(daily_max_dd_inr, trade_max_dd_inr, intratrade_max_dd_inr)
 
     # 3. Calmar Ratio (CAGR / Max Drawdown)
     calmar_ratio = cagr / max_dd_pct if max_dd_pct > 0 else np.nan
@@ -912,6 +999,8 @@ def generate_performance_summary(trades_df: pd.DataFrame, all_dates: pd.Series):
     exit_breakdown_str = " | ".join([f"{k}: {v}" for k, v in exit_counts.items()])
     print(f" TRADE EXITS        : {exit_breakdown_str}")
     print(f" COMBINED TOTAL PNL : ₹{combined_total_pnl:,.2f}")
+    total_stat_costs = trades_df["stat_cost"].sum() if "stat_cost" in trades_df else 0.0
+    print(f" TOTAL STATUTORY FEES: ₹{total_stat_costs:,.2f} (STT, GST, Exch, Stamp Duty, Brokerage)")
     print(f" BEST YEAR          : {best_year}")
     print(f" BEST MONTH         : {best_month}")
     print(f" WORST MONTH        : {worst_month}")

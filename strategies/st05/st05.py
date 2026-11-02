@@ -26,6 +26,20 @@ NUM_LOTS = int(os.getenv("NUM_LOTS", "2"))
 QUANTITY = NIFTY_LOT_SIZE * NUM_LOTS
 SLIPPAGE_AND_COSTS_PTS = float(os.getenv("SLIPPAGE_AND_COSTS_PTS", "2.0"))
 
+# Enhancement 1: Dynamic Position Sizing (Fixed Fractional Risk)
+ENABLE_DYNAMIC_SIZING = os.getenv("ENABLE_DYNAMIC_SIZING", "True").lower() in ("true", "1", "yes")
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+MIN_LOTS = int(os.getenv("MIN_LOTS", "1"))
+MAX_LOTS = int(os.getenv("MAX_LOTS", "5"))
+
+# Enhancement 2: Daily Trade Limits & Circuit Breaker
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "2"))
+MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))
+
+# Enhancement 3: Breakeven Stop-Loss Trailing
+ENABLE_BREAKEVEN = os.getenv("ENABLE_BREAKEVEN", "True").lower() in ("true", "1", "yes")
+BREAKEVEN_R_MULTIPLE = float(os.getenv("BREAKEVEN_R_MULTIPLE", "1.5"))
+
 # CAGR Performance Rating Thresholds (in %) from env
 CAGR_BAD_BELOW = float(os.getenv("CAGR_BAD_BELOW", "12.0"))
 CAGR_ACCEPTABLE_MAX = float(os.getenv("CAGR_ACCEPTABLE_MAX", "16.0"))
@@ -370,84 +384,148 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ==============================================================================
 def run_st05_backtest(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Executes ST05 Rules:
+    Executes ST05 Rules with Enhancements:
     - Long Setup: Close > EMA10 & EMA20, EMA10 > EMA20, both EMAs sloping up, SuperTrend == Green (1), Green candle
     - Short Setup: Close < EMA10 & EMA20, EMA10 < EMA20, both EMAs sloping down, SuperTrend == Red (-1), Red candle
     - Entry: Break of setup candle High (Long) or Low (Short)
     - SL: Low of setup candle (Long) or High of setup candle (Short)
     - Target: 1:3 Risk-Reward (or 3:15 PM intraday square-off)
+    - Rec 1: Dynamic Position Sizing (Risk 1% of current capital per trade, bounded by MIN_LOTS and MAX_LOTS)
+    - Rec 2: Daily Trade Limits (Max 2 trades/day and Circuit Breaker on 2 losses)
+    - Rec 3: Breakeven Stop-Loss (Move SL to entry once price advances +1.5R)
     """
     trades = []
+    current_capital = INITIAL_CAPITAL
     
     for trade_date, day_df in df.groupby("date"):
         day_df = day_df.reset_index(drop=True)
         position = None      # None, "LONG", or "SHORT"
         pending_setup = None # Stores setup candle trigger levels
+        day_trades_count = 0
+        day_losses_count = 0
         
         for i in range(1, len(day_df)):
             row = day_df.iloc[i]
             
             # 1. Manage Open Position
             if position is not None:
+                risk_pts = position["risk_pts"]
+                
+                # Recommendation 3: Breakeven Check
+                if ENABLE_BREAKEVEN and not position["be_triggered"]:
+                    if position["side"] == "LONG" and row["high"] >= position["entry"] + (BREAKEVEN_R_MULTIPLE * risk_pts):
+                        position["sl"] = position["entry"]
+                        position["be_triggered"] = True
+                    elif position["side"] == "SHORT" and row["low"] <= position["entry"] - (BREAKEVEN_R_MULTIPLE * risk_pts):
+                        position["sl"] = position["entry"]
+                        position["be_triggered"] = True
+
                 # End of Day Intraday Square-off at 15:15 IST
                 if row["time"] >= dt.time(15, 15):
                     exit_price = row["close"]
                     pnl_pts = (exit_price - position["entry"]) if position["side"] == "LONG" else (position["entry"] - exit_price)
                     pnl_pts -= SLIPPAGE_AND_COSTS_PTS
+                    pnl_inr = pnl_pts * position["qty"]
+                    current_capital += pnl_inr
                     trades.append({**position, "exit_time": row["timestamp"], "exit": exit_price,
-                                   "pnl_pts": pnl_pts, "pnl_inr": pnl_pts * QUANTITY, "exit_reason": "EOD"})
+                                   "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "EOD"})
+                    day_trades_count += 1
+                    if pnl_pts <= 0:
+                        day_losses_count += 1
                     position = None
                     break
                 
                 # Check SL and Target inside the 15-min bar
                 if position["side"] == "LONG":
-                    if row["low"] <= position["sl"]:
-                        pnl_pts = (position["sl"] - position["entry"]) - SLIPPAGE_AND_COSTS_PTS
-                        trades.append({**position, "exit_time": row["timestamp"], "exit": position["sl"],
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_pts * QUANTITY, "exit_reason": "SL"})
-                        position = None
-                    elif row["high"] >= position["target"]:
+                    if row["high"] >= position["target"]:
                         pnl_pts = (position["target"] - position["entry"]) - SLIPPAGE_AND_COSTS_PTS
+                        pnl_inr = pnl_pts * position["qty"]
+                        current_capital += pnl_inr
                         trades.append({**position, "exit_time": row["timestamp"], "exit": position["target"],
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_pts * QUANTITY, "exit_reason": "TARGET"})
+                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "TARGET"})
+                        day_trades_count += 1
+                        position = None
+                    elif row["low"] <= position["sl"]:
+                        pnl_pts = (position["sl"] - position["entry"]) - SLIPPAGE_AND_COSTS_PTS
+                        pnl_inr = pnl_pts * position["qty"]
+                        current_capital += pnl_inr
+                        exit_reason = "BREAKEVEN" if position["be_triggered"] and position["sl"] >= position["entry"] else "SL"
+                        trades.append({**position, "exit_time": row["timestamp"], "exit": position["sl"],
+                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": exit_reason})
+                        day_trades_count += 1
+                        if pnl_pts <= 0:
+                            day_losses_count += 1
                         position = None
                 elif position["side"] == "SHORT":
-                    if row["high"] >= position["sl"]:
-                        pnl_pts = (position["entry"] - position["sl"]) - SLIPPAGE_AND_COSTS_PTS
-                        trades.append({**position, "exit_time": row["timestamp"], "exit": position["sl"],
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_pts * QUANTITY, "exit_reason": "SL"})
-                        position = None
-                    elif row["low"] <= position["target"]:
+                    if row["low"] <= position["target"]:
                         pnl_pts = (position["entry"] - position["target"]) - SLIPPAGE_AND_COSTS_PTS
+                        pnl_inr = pnl_pts * position["qty"]
+                        current_capital += pnl_inr
                         trades.append({**position, "exit_time": row["timestamp"], "exit": position["target"],
-                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_pts * QUANTITY, "exit_reason": "TARGET"})
+                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": "TARGET"})
+                        day_trades_count += 1
+                        position = None
+                    elif row["high"] >= position["sl"]:
+                        pnl_pts = (position["entry"] - position["sl"]) - SLIPPAGE_AND_COSTS_PTS
+                        pnl_inr = pnl_pts * position["qty"]
+                        current_capital += pnl_inr
+                        exit_reason = "BREAKEVEN" if position["be_triggered"] and position["sl"] <= position["entry"] else "SL"
+                        trades.append({**position, "exit_time": row["timestamp"], "exit": position["sl"],
+                                       "pnl_pts": pnl_pts, "pnl_inr": pnl_inr, "exit_reason": exit_reason})
+                        day_trades_count += 1
+                        if pnl_pts <= 0:
+                            day_losses_count += 1
                         position = None
 
+            # Recommendation 2: Daily trade and circuit breaker limits
+            can_trade_today = (day_trades_count < MAX_TRADES_PER_DAY) and (day_losses_count < MAX_LOSSES_PER_DAY)
+
             # 2. Check if Pending Setup Triggers on Current Bar (No new entries after 14:30)
-            if position is None and pending_setup is not None and row["time"] <= dt.time(14, 30):
+            if position is None and pending_setup is not None and row["time"] <= dt.time(14, 30) and can_trade_today:
                 if pending_setup["side"] == "LONG" and row["high"] > pending_setup["trigger"]:
                     entry_px = max(row["open"], pending_setup["trigger"])
                     risk = entry_px - pending_setup["sl"]
                     if risk > 5: # Minimum 5 pt risk filter to avoid micro-candle noise
+                        # Recommendation 1: Dynamic Position Sizing
+                        if ENABLE_DYNAMIC_SIZING:
+                            risk_budget = max(current_capital, 100000.0) * (RISK_PER_TRADE_PCT / 100.0)
+                            lots = max(MIN_LOTS, int(risk_budget / (risk * NIFTY_LOT_SIZE)))
+                            lots = min(lots, MAX_LOTS)
+                        else:
+                            lots = NUM_LOTS
+                        qty = lots * NIFTY_LOT_SIZE
+                        
                         position = {
                             "date": trade_date, "side": "LONG", "entry_time": row["timestamp"],
-                            "entry": entry_px, "sl": pending_setup["sl"],
-                            "target": entry_px + (RISK_REWARD_RATIO * risk)
+                            "entry": entry_px, "sl": pending_setup["sl"], "risk_pts": risk,
+                            "target": entry_px + (RISK_REWARD_RATIO * risk),
+                            "lots": lots, "qty": qty, "be_triggered": False
                         }
                     pending_setup = None
                 elif pending_setup["side"] == "SHORT" and row["low"] < pending_setup["trigger"]:
                     entry_px = min(row["open"], pending_setup["trigger"])
                     risk = pending_setup["sl"] - entry_px
                     if risk > 5:
+                        if ENABLE_DYNAMIC_SIZING:
+                            risk_budget = max(current_capital, 100000.0) * (RISK_PER_TRADE_PCT / 100.0)
+                            lots = max(MIN_LOTS, int(risk_budget / (risk * NIFTY_LOT_SIZE)))
+                            lots = min(lots, MAX_LOTS)
+                        else:
+                            lots = NUM_LOTS
+                        qty = lots * NIFTY_LOT_SIZE
+                        
                         position = {
                             "date": trade_date, "side": "SHORT", "entry_time": row["timestamp"],
-                            "entry": entry_px, "sl": pending_setup["sl"],
-                            "target": entry_px - (RISK_REWARD_RATIO * risk)
+                            "entry": entry_px, "sl": pending_setup["sl"], "risk_pts": risk,
+                            "target": entry_px - (RISK_REWARD_RATIO * risk),
+                            "lots": lots, "qty": qty, "be_triggered": False
                         }
                     pending_setup = None
+            elif not can_trade_today:
+                pending_setup = None
 
             # 3. Identify New Setup Candle (ST05 Alignment)
-            if position is None and row["time"] < dt.time(14, 15):
+            if position is None and row["time"] < dt.time(14, 15) and can_trade_today:
                 is_green = row["close"] > row["open"]
                 is_red = row["close"] < row["open"]
                 
@@ -617,6 +695,9 @@ def generate_performance_summary(trades_df: pd.DataFrame, all_dates: pd.Series):
     ]
     print(tabulate(summary_table, tablefmt="fancy_grid"))
 
+    exit_counts = trades_df["exit_reason"].value_counts().to_dict() if "exit_reason" in trades_df else {}
+    exit_breakdown_str = " | ".join([f"{k}: {v}" for k, v in exit_counts.items()])
+    print(f" TRADE EXITS        : {exit_breakdown_str}")
     print(f" COMBINED TOTAL PNL : ₹{combined_total_pnl:,.2f}")
     print(f" BEST YEAR          : {best_year}")
     print(f" BEST MONTH         : {best_month}")

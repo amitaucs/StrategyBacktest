@@ -1,7 +1,9 @@
-# Environment & Secrets
+# Environment Variables & Secrets
 .env
 *.env
 !.env.example
+.env.local
+.env.*.local
 
 # Python
 __pycache__/
@@ -9,16 +11,49 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
-venv/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
 .venv/
+venv/
+env/
+ENV/
 .dhan/
 
-# Distribution / Packaging
-build/
-dist/
-*.egg-info/
-
-# Logs & temp
+# Logs & Storage
 *.log
+logs/
+*.sqlite3
 
+# Data files & Backtest outputs (optional / dumps)
+*.parquet
+*.feather
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

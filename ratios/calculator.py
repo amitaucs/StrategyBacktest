@@ -44,6 +44,9 @@ def calculate_ratios(
     Returns:
         Dictionary containing all metrics, series, ratings, and summary classifications.
     """
+    if not isinstance(all_dates, pd.Series):
+        all_dates = pd.Series(list(all_dates))
+
     if trades_df.empty:
         return {
             "empty": True,

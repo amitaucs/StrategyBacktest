@@ -91,6 +91,35 @@ class TestRatiosPackage(unittest.TestCase):
         self.assertIn("max_dd_pct", res)
         self.assertIn("overall_outcome", res)
 
+    def test_monthly_frequency_auto_detection(self):
+        """Verify that monthly dates are correctly auto-detected and annualized with 12 periods."""
+        dates = pd.date_range("2020-01-31", periods=24, freq="ME")
+        trades = pd.DataFrame([
+            {"date": dates[5].date(), "pnl_inr": 50000.0, "stat_cost": 500.0, "exit_reason": "EXIT_21EMA", "mae_inr": 2000.0},
+            {"date": dates[12].date(), "pnl_inr": -10000.0, "stat_cost": 500.0, "exit_reason": "SL", "mae_inr": 10000.0},
+        ])
+        res = calculate_ratios(trades, pd.Series(dates.date), initial_capital=1000000.0)
+        self.assertEqual(res["frequency"], "monthly")
+        # 24 monthly periods
+        self.assertEqual(res["total_days"], 24)
+        # Verify Sharpe ratio is computed without error
+        self.assertFalse(pd.isna(res["sharpe_ratio"]))
+
+    def test_mae_evaluated_against_contemporaneous_peak(self):
+        """Verify that intra-trade MAE drawdown is evaluated against contemporaneous equity peak rather than initial capital."""
+        dates = pd.date_range("2023-01-01", periods=20, freq="B")
+        # Trade 1: initial capital doubles from 1,000,000 to 2,000,000 (contemporaneous peak = 2,000,000)
+        # Trade 2: suffers 200,000 MAE drawdown.
+        # Against contemporaneous peak (2,000,000): 200,000 / 2,000,000 = 10.0%.
+        # Against initial capital (1,000,000): 200,000 / 1,000,000 = 20.0% (incorrect).
+        trades = pd.DataFrame([
+            {"date": dates[5].date(), "pnl_inr": 1000000.0, "stat_cost": 500.0, "exit_reason": "TARGET", "mae_inr": 0.0},
+            {"date": dates[10].date(), "pnl_inr": 0.0, "stat_cost": 500.0, "exit_reason": "EXIT", "mae_inr": 200000.0},
+        ])
+        res = calculate_ratios(trades, pd.Series(dates.date), initial_capital=1000000.0)
+        self.assertAlmostEqual(res["max_dd_pct"], 10.0, places=2)
+        self.assertEqual(res["max_dd_inr"], 200000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

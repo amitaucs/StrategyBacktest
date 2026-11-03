@@ -5,7 +5,8 @@ Formats and prints the standardized 12-ratio institutional scorecard,
 exit breakdowns, and threshold compliance summaries using tabulate.
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+import numpy as np
 import pandas as pd
 from tabulate import tabulate
 
@@ -63,6 +64,9 @@ def generate_performance_summary(
     initial_capital: float = 1_000_000.0,
     strategy_title: str = "NIFTY 15M ST05 STRATEGY",
     risk_free_rate: float = 0.065,
+    frequency: str = "auto",
+    equity_curve: Optional[pd.Series] = None,
+    open_positions: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Computes and prints the full institutional performance dashboard in the terminal.
@@ -73,12 +77,15 @@ def generate_performance_summary(
         initial_capital: Starting capital in ₹.
         strategy_title: Title header for the terminal report.
         risk_free_rate: Annual risk-free rate (default: 6.5% p.a.).
+        frequency: Observation frequency for return annualization: 'auto', 'daily', 'monthly', or 'weekly'.
+        equity_curve: Optional explicit Mark-to-Market equity series.
+        open_positions: Optional list of active open holding dictionaries.
 
     Returns:
         The metrics dictionary computed by calculate_ratios, or None if trades_df is empty.
     """
-    if trades_df.empty:
-        print(f"\nNo trades generated for {strategy_title} during the backtest period.\n")
+    if trades_df.empty and (equity_curve is None or len(equity_curve) == 0):
+        print(f"\nNo trades or positions generated for {strategy_title} during the backtest period.\n")
         return None
 
     m = calculate_ratios(
@@ -86,35 +93,72 @@ def generate_performance_summary(
         all_dates=all_dates,
         initial_capital=initial_capital,
         risk_free_rate=risk_free_rate,
+        frequency=frequency,
+        equity_curve=equity_curve,
     )
 
     if m.get("empty", False):
-        print(f"\nNo trades generated for {strategy_title} during the backtest period.\n")
+        print(f"\nNo trades or positions generated for {strategy_title} during the backtest period.\n")
         return None
 
     # Print Dashboard Header
+    obs_label = "MONTHS" if m.get("frequency") == "monthly" else ("WEEKS" if m.get("frequency") == "weekly" else "DAYS")
     print("\n" + "=" * 85)
     print(f" BACKTEST PERFORMANCE SUMMARY — {strategy_title.upper()}")
     print(f" PERIOD: {m['start_date'].strftime('%Y-%m-%d')} to {m['end_date'].strftime('%Y-%m-%d')} | "
-          f"TOTAL TRADES: {m['total_trades']} | TOTAL DAYS: {m['total_days']} | CAPITAL: ₹{m['initial_capital']:,.0f}")
+          f"TOTAL TRADES: {m['total_trades']} | TOTAL {obs_label}: {m['total_days']} | CAPITAL: ₹{m['initial_capital']:,.0f}")
     print("=" * 85)
 
     # 12-Metric Scorecard Grid
+    pf_display = f"{m['profit_factor']:.2f} ({m['profit_factor_rating']})" if not pd.isna(m.get('profit_factor', np.nan)) else f"{m['profit_factor_rating']}"
+    exp_display = f"₹{m['expectancy_per_trade']:,.2f} ({m['expectancy_rating']})" if m['total_trades'] > 0 else f"{m['expectancy_rating']}"
+    rf_display = f"{m['recovery_factor']:.2f} ({m['recovery_factor_rating']})" if not pd.isna(m.get('recovery_factor', np.nan)) else f"{m['recovery_factor_rating']}"
+    wr_display = f"{m['win_rate']:.2f}% ({m['win_rate_rating']})" if m['total_trades'] > 0 else f"{m['win_rate_rating']}"
+    wl_display = f"{m['avg_win_loss_ratio']:.2f} ({m['win_loss_rating']})" if m['total_trades'] > 0 else f"{m['win_loss_rating']}"
+
     summary_table = [
         ["1. CAGR (Annual Return)", f"{m['cagr']:.2f}% ({m['cagr_rating']})", "2. Maximum Drawdown", f"{m['max_dd_pct']:.2f}% ({m['max_dd_rating']})"],
         ["3. Calmar Ratio", f"{m['calmar_ratio']:.2f} ({m['calmar_rating']})", "4. Sharpe Ratio", f"{m['sharpe_ratio']:.2f} ({m['sharpe_rating']})"],
-        ["5. Sortino Ratio", f"{m['sortino_ratio']:.2f} ({m['sortino_rating']})", "6. Profit Factor", f"{m['profit_factor']:.2f} ({m['profit_factor_rating']})"],
-        ["7. Expectancy (Per Trade)", f"₹{m['expectancy_per_trade']:,.2f} ({m['expectancy_rating']})", "8. Recovery Factor", f"{m['recovery_factor']:.2f} ({m['recovery_factor_rating']})"],
-        ["9. Win Rate", f"{m['win_rate']:.2f}% ({m['win_rate_rating']})", "10. Avg Win / Avg Loss", f"{m['avg_win_loss_ratio']:.2f} ({m['win_loss_rating']})"],
+        ["5. Sortino Ratio", f"{m['sortino_ratio']:.2f} ({m['sortino_rating']})", "6. Profit Factor", pf_display],
+        ["7. Expectancy (Per Trade)", exp_display, "8. Recovery Factor", rf_display],
+        ["9. Win Rate", wr_display, "10. Avg Win / Avg Loss", wl_display],
         ["11. Consecutive Losing Trades", f"{m['max_consecutive_losses']} ({m['consec_losses_rating']})", "12. Max DD Duration", f"{m['max_dd_duration_months']:.1f}M [Avg: {m['avg_dd_duration_months']:.1f}M] ({m['dd_duration_rating']})"]
     ]
     print(tabulate(summary_table, tablefmt="fancy_grid"))
 
+    # Active Open Holdings (Marked-to-Market)
+    if open_positions:
+        print("\n ACTIVE OPEN HOLDINGS (MARKED TO MARKET):")
+        open_table = []
+        for op in open_positions:
+            open_table.append([
+                op.get("symbol", "N/A"),
+                str(op.get("entry_date", "N/A")),
+                f"₹{op.get('entry', 0.0):,.2f}",
+                f"₹{op.get('current_price', 0.0):,.2f}",
+                f"{op.get('qty', 0):,}",
+                f"₹{op.get('unrealized_pnl', 0.0):,.2f}",
+                f"{op.get('unrealized_return_pct', 0.0):+.2f}%",
+                f"₹{op.get('sl', 0.0):,.2f}",
+            ])
+        headers = ["Symbol", "Entry Date", "Entry Price", "Current CMP", "Qty", "Unrealized P&L", "Return (%)", "Stop Loss"]
+        print(tabulate(open_table, headers=headers, tablefmt="fancy_grid"))
+
     # Trade Exits & Monetary Breakdown
-    exit_breakdown_str = " | ".join([f"{k}: {v}" for k, v in m["exit_counts"].items()]) if m["exit_counts"] else "None"
-    print(f" TRADE EXITS        : {exit_breakdown_str}")
-    print(f" COMBINED TOTAL PNL : ₹{m['combined_total_pnl']:,.2f}")
-    print(f" TOTAL STATUTORY FEES: ₹{m['total_stat_costs']:,.2f} (STT, GST, Exch, Stamp Duty, Brokerage)")
+    exit_breakdown_str = " | ".join([f"{k}: {v}" for k, v in m["exit_counts"].items()]) if m["exit_counts"] else "None (Holdings Open)"
+    print(f"\n REALIZED EXITS     : {exit_breakdown_str}")
+    if open_positions:
+        realized_pnl = trades_df["pnl_inr"].sum() if not trades_df.empty else 0.0
+        unrealized_pnl = sum(op.get("unrealized_pnl", 0.0) for op in open_positions)
+        print(f" REALIZED PNL       : ₹{realized_pnl:,.2f}")
+        print(f" UNREALIZED MTM PNL : ₹{unrealized_pnl:,.2f}")
+        print(f" COMBINED TOTAL PNL : ₹{realized_pnl + unrealized_pnl:,.2f}")
+    else:
+        print(f" COMBINED TOTAL PNL : ₹{m['combined_total_pnl']:,.2f}")
+    total_stat_fees = m['total_stat_costs']
+    if open_positions:
+        total_stat_fees += sum(op.get("entry_charges", 0.0) for op in open_positions)
+    print(f" TOTAL STATUTORY FEES: ₹{total_stat_fees:,.2f} (STT, GST, Exch, Stamp Duty, Brokerage)")
     print(f" BEST YEAR          : {m['best_year']}")
     print(f" BEST MONTH         : {m['best_month']}")
     print(f" WORST MONTH        : {m['worst_month']}")

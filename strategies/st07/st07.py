@@ -340,7 +340,7 @@ def compute_indicators(
     return df
 
 # ==============================================================================
-# 5. ST07 INTRADAY / POSITIONAL BACKTEST ENGINE (DUAL-TIMEFRAME)
+# 5. STANDALONE SINGLE-ASSET BACKTEST ADAPTER
 # ==============================================================================
 def run_st07_backtest(
     df_daily: pd.DataFrame,
@@ -350,264 +350,18 @@ def run_st07_backtest(
     slippage_pct: float = ST07_SLIPPAGE_PCT
 ) -> Tuple[pd.DataFrame, pd.Series, List[Dict[str, Any]]]:
     """
-    Executes ST07 Positional Strategy Backtest with Dual-Timeframe Execution:
-    - Monthly signals: Monthly HA crossover with rising 89 EMA confirms entry setups and 21 EMA exits.
-    - Excludes incomplete current month from signal generation; completed months only for indicators.
-    - Daily execution: Stop-loss monitoring and MTM equity step through underlying daily candles.
-    - Daily Gap-Down protection: If price gaps below SL on any day, fills at daily open (min(open, SL)).
-    - Causal Realism: Exits at next-month open for 21 EMA, no same-month re-entry lookahead.
-    - Realism: Fills, slippage, and P&L strictly calculated on actual exchange prices.
-    - Active Open Holdings: Not artificially closed as END_OF_DATA; marked to market separately.
+    Executes ST07 Positional Strategy Backtest for a single instrument.
+    Delegates directly to the unified chronological execution engine with max_positions=1
+    to guarantee 100% architectural consistency and zero divergence between standalone
+    and portfolio simulations.
     """
-    trades = []
-    position = None
-    current_capital = initial_capital
-    slippage_mult = slippage_pct / 100.0
-    mtm_equity = {}
-
-    daily_by_ym = {ym: group.sort_values("date").reset_index(drop=True) for ym, group in df_daily.groupby("ym")}
-
-    # 1. Iterate through completed months
-    for m_idx in range(len(df_monthly)):
-        curr_month = df_monthly.iloc[m_idx]
-        ym = curr_month["ym"]
-        if ym not in daily_by_ym:
-            continue
-        month_daily = daily_by_ym[ym]
-        prev_month = df_monthly.iloc[m_idx - 1] if m_idx > 0 else None
-
-        # Record whether a position was already open at the start of this month.
-        # This guarantees causal execution: if an existing position exits during this month,
-        # the engine CANNOT retroactively enter a new trade at this same month's open.
-        position_at_month_open = position is not None
-        first_day = month_daily.iloc[0]
-
-        # ----------------------------------------------------------------------
-        # A. PROCESS PENDING 21 EMA EXIT AT FIRST DAY OPEN
-        # ----------------------------------------------------------------------
-        if position is not None and position.get("pending_exit_21ema", False):
-            exit_price = first_day["open"] * (1.0 - slippage_mult)
-            exit_charges = calculate_exit_charges(exit_price, position["qty"])
-            stat_cost = position.get("entry_charges", 0.0) + exit_charges
-            pnl_inr_gross = (exit_price - position["entry"]) * position["qty"]
-            pnl_inr_net = pnl_inr_gross - stat_cost
-            current_capital += (exit_price * position["qty"]) - exit_charges
-
-            # Execution-aware MAE: adverse excursion up to the execution fill at open
-            final_mae_pts = max(position.get("mae_pts", 0.0), max(0.0, position["entry"] - exit_price))
-            trades.append({
-                "symbol": symbol,
-                "date": first_day["date"],
-                "entry_date": position["entry_date"],
-                "exit_date": first_day["date"],
-                "side": "LONG",
-                "entry": position["entry"],
-                "exit": exit_price,
-                "sl": position["sl"],
-                "qty": position["qty"],
-                "pnl_inr": pnl_inr_net,
-                "pnl_pts": pnl_inr_net / position["qty"],
-                "exit_reason": "EXIT_21EMA",
-                "stat_cost": stat_cost,
-                "mae_inr": final_mae_pts * position["qty"],
-            })
-            position = None
-
-        # ----------------------------------------------------------------------
-        # B. TRIGGER NEW ENTRY (Only eligible if NO position was held at month open)
-        # ----------------------------------------------------------------------
-        if not position_at_month_open and prev_month is not None and not prev_month["is_warmup"]:
-            if prev_month["setup_valid"]:
-                entry_price = first_day["open"] * (1.0 + slippage_mult)
-                sl_price = prev_month["low"]  # Real market low of crossover setup candle
-                risk_pts = entry_price - sl_price
-
-                if risk_pts > 0:
-                    qty = calculate_max_affordable_qty(current_capital, entry_price)
-                    entry_charges = calculate_entry_charges(entry_price, qty)
-                    entry_total_cost = (entry_price * qty) + entry_charges
-                    if qty > 0 and current_capital >= entry_total_cost:
-                        current_capital -= entry_total_cost
-                        position = {
-                            "symbol": symbol,
-                            "entry_date": first_day["date"],
-                            "entry": entry_price,
-                            "sl": sl_price,
-                            "risk_pts": risk_pts,
-                            "qty": qty,
-                            "entry_charges": entry_charges,
-                            "mae_pts": 0.0,
-                            "pending_exit_21ema": False,
-                        }
-
-        # ----------------------------------------------------------------------
-        # C. DAILY BAR LOOP (Intra-month Stop Monitoring & Daily MTM Equity)
-        # ----------------------------------------------------------------------
-        for _, day_row in month_daily.iterrows():
-            d = day_row["date"]
-            if position is not None:
-                # Check stop-loss breach on the daily candle (captures true gap-downs)
-                if day_row["low"] <= position["sl"]:
-                    sl_fill = min(day_row["open"], position["sl"])
-                    exit_price = sl_fill * (1.0 - slippage_mult)
-                    exit_charges = calculate_exit_charges(exit_price, position["qty"])
-                    stat_cost = position.get("entry_charges", 0.0) + exit_charges
-                    pnl_inr_gross = (exit_price - position["entry"]) * position["qty"]
-                    pnl_inr_net = pnl_inr_gross - stat_cost
-                    current_capital += (exit_price * position["qty"]) - exit_charges
-
-                    # Execution-aware MAE: trade stopped out at exit_price; ignore subsequent drop after exit
-                    final_mae_pts = max(position.get("mae_pts", 0.0), max(0.0, position["entry"] - exit_price))
-                    trades.append({
-                        "symbol": symbol,
-                        "date": d,
-                        "entry_date": position["entry_date"],
-                        "exit_date": d,
-                        "side": "LONG",
-                        "entry": position["entry"],
-                        "exit": exit_price,
-                        "sl": position["sl"],
-                        "qty": position["qty"],
-                        "pnl_inr": pnl_inr_net,
-                        "pnl_pts": pnl_inr_net / position["qty"],
-                        "exit_reason": "SL_ENTRY_CANDLE",
-                        "stat_cost": stat_cost,
-                        "mae_inr": final_mae_pts * position["qty"],
-                    })
-                    position = None
-                else:
-                    adverse = max(0.0, position["entry"] - day_row["low"])
-                    position["mae_pts"] = max(position.get("mae_pts", 0.0), adverse)
-
-            open_val = position["qty"] * day_row["close"] if position is not None else 0.0
-            mtm_equity[d] = current_capital + open_val
-
-        # ----------------------------------------------------------------------
-        # D. MONTH-END 21 EMA CHECK
-        # ----------------------------------------------------------------------
-        if position is not None:
-            if curr_month["ha_close"] < curr_month["ema21"]:
-                position["pending_exit_21ema"] = True
-
-    # 2. Process incomplete current month daily bars (e.g. current in-progress month)
-    completed_yms = set(df_monthly["ym"])
-    for ym, month_daily in daily_by_ym.items():
-        if ym not in completed_yms:
-            first_day = month_daily.iloc[0]
-            position_at_month_open = position is not None
-
-            # Pending 21 EMA exit confirmed from the last completed month
-            if position is not None and position.get("pending_exit_21ema", False):
-                exit_price = first_day["open"] * (1.0 - slippage_mult)
-                exit_charges = calculate_exit_charges(exit_price, position["qty"])
-                stat_cost = position.get("entry_charges", 0.0) + exit_charges
-                pnl_inr_gross = (exit_price - position["entry"]) * position["qty"]
-                pnl_inr_net = pnl_inr_gross - stat_cost
-                current_capital += (exit_price * position["qty"]) - exit_charges
-
-                # Execution-aware MAE: adverse excursion up to the execution fill at open
-                final_mae_pts = max(position.get("mae_pts", 0.0), max(0.0, position["entry"] - exit_price))
-                trades.append({
-                    "symbol": symbol,
-                    "date": first_day["date"],
-                    "entry_date": position["entry_date"],
-                    "exit_date": first_day["date"],
-                    "side": "LONG",
-                    "entry": position["entry"],
-                    "exit": exit_price,
-                    "sl": position["sl"],
-                    "qty": position["qty"],
-                    "pnl_inr": pnl_inr_net,
-                    "pnl_pts": pnl_inr_net / position["qty"],
-                    "exit_reason": "EXIT_21EMA",
-                    "stat_cost": stat_cost,
-                    "mae_inr": final_mae_pts * position["qty"],
-                })
-                position = None
-
-            # New entry from the last completed month's setup
-            if len(df_monthly) > 0:
-                last_m = df_monthly.iloc[-1]
-                if not position_at_month_open and not last_m["is_warmup"] and last_m["setup_valid"]:
-                    entry_price = first_day["open"] * (1.0 + slippage_mult)
-                    sl_price = last_m["low"]
-                    risk_pts = entry_price - sl_price
-                    if risk_pts > 0:
-                        qty = calculate_max_affordable_qty(current_capital, entry_price)
-                        entry_charges = calculate_entry_charges(entry_price, qty)
-                        entry_total_cost = (entry_price * qty) + entry_charges
-                        if qty > 0 and current_capital >= entry_total_cost:
-                            current_capital -= entry_total_cost
-                            position = {
-                                "symbol": symbol,
-                                "entry_date": first_day["date"],
-                                "entry": entry_price,
-                                "sl": sl_price,
-                                "risk_pts": risk_pts,
-                                "qty": qty,
-                                "entry_charges": entry_charges,
-                                "mae_pts": 0.0,
-                                "pending_exit_21ema": False,
-                            }
-
-            # Daily bars inside incomplete month
-            for _, day_row in month_daily.iterrows():
-                d = day_row["date"]
-                if position is not None:
-                    if day_row["low"] <= position["sl"]:
-                        sl_fill = min(day_row["open"], position["sl"])
-                        exit_price = sl_fill * (1.0 - slippage_mult)
-                        exit_charges = calculate_exit_charges(exit_price, position["qty"])
-                        stat_cost = position.get("entry_charges", 0.0) + exit_charges
-                        pnl_inr_gross = (exit_price - position["entry"]) * position["qty"]
-                        pnl_inr_net = pnl_inr_gross - stat_cost
-                        current_capital += (exit_price * position["qty"]) - exit_charges
-
-                        # Execution-aware MAE: trade stopped out at exit_price; ignore subsequent drop after exit
-                        final_mae_pts = max(position.get("mae_pts", 0.0), max(0.0, position["entry"] - exit_price))
-                        trades.append({
-                            "symbol": symbol,
-                            "date": d,
-                            "entry_date": position["entry_date"],
-                            "exit_date": d,
-                            "side": "LONG",
-                            "entry": position["entry"],
-                            "exit": exit_price,
-                            "sl": position["sl"],
-                            "qty": position["qty"],
-                            "pnl_inr": pnl_inr_net,
-                            "pnl_pts": pnl_inr_net / position["qty"],
-                            "exit_reason": "SL_ENTRY_CANDLE",
-                            "stat_cost": stat_cost,
-                            "mae_inr": final_mae_pts * position["qty"],
-                        })
-                        position = None
-                    else:
-                        adverse = max(0.0, position["entry"] - day_row["low"])
-                        position["mae_pts"] = max(position.get("mae_pts", 0.0), adverse)
-
-                open_val = position["qty"] * day_row["close"] if position is not None else 0.0
-                mtm_equity[d] = current_capital + open_val
-
-    # 3. Active Open Holdings (Marked-to-Market, NOT forcibly closed as END_OF_DATA)
-    open_holdings = []
-    if position is not None:
-        last_close = df_daily.iloc[-1]["close"]
-        unrealized_pnl = (last_close - position["entry"]) * position["qty"] - position.get("entry_charges", 0.0)
-        unrealized_return_pct = ((last_close - position["entry"]) / position["entry"]) * 100.0
-        open_holdings.append({
-            "symbol": symbol,
-            "entry_date": position["entry_date"],
-            "entry": position["entry"],
-            "current_price": last_close,
-            "qty": position["qty"],
-            "sl": position["sl"],
-            "entry_charges": position.get("entry_charges", 0.0),
-            "unrealized_pnl": unrealized_pnl,
-            "unrealized_return_pct": unrealized_return_pct,
-        })
-
-    return pd.DataFrame(trades), pd.Series(mtm_equity), open_holdings
+    return run_st07_portfolio_backtest(
+        daily_by_sym={symbol: df_daily},
+        monthly_by_sym={symbol: df_monthly},
+        initial_capital=initial_capital,
+        max_positions=1,
+        slippage_pct=slippage_pct
+    )
 
 # ==============================================================================
 # 6. CHRONOLOGICAL SHARED-CASH PORTFOLIO SIMULATION ENGINE (DAILY EXECUTION)
@@ -667,7 +421,14 @@ def run_st07_portfolio_backtest(
             row_m = df_m.iloc[m_idx]
             ym_val = row_m["ym"]
             monthly_by_ym[sym][ym_val] = row_m
-            prev_monthly_by_ym[sym][ym_val] = df_m.iloc[m_idx - 1] if m_idx > 0 else None
+
+        # Directly retrieve the latest completed monthly row strictly preceding each daily month.
+        # This guarantees that incomplete current months (e.g. November) correctly retrieve the setup
+        # from the immediately preceding completed month (e.g. October).
+        df_m_sorted = df_m.sort_values("ym").reset_index(drop=True)
+        for ym_val in df_d["ym"].unique():
+            preceding_m = df_m_sorted[df_m_sorted["ym"] < ym_val]
+            prev_monthly_by_ym[sym][ym_val] = preceding_m.iloc[-1] if not preceding_m.empty else None
 
     # Sorted union of all trading dates across all symbols
     all_dates = sorted(list(set.union(*[set(df["date"]) for df in daily_by_sym.values()])))
@@ -730,7 +491,7 @@ def run_st07_portfolio_backtest(
                         risk_pts = entry_price - sl_price
 
                         if risk_pts > 0:
-                            alloc_cap = min(shared_cash, initial_capital / max_positions)
+                            alloc_cap = shared_cash if max_positions == 1 else min(shared_cash, initial_capital / max_positions)
                             qty = calculate_max_affordable_qty(alloc_cap, entry_price)
                             entry_charges = calculate_entry_charges(entry_price, qty)
                             entry_total_cost = (entry_price * qty) + entry_charges
